@@ -25,4 +25,4 @@ Example:
 ```
 The optimal number of max\_concurrent and num\_worker_thread depends on the machine.
 
-In testing, the author had found that the server can handle at least ```10000``` concurrent connection at at least ```40000``` request / second using ```httperf```. Using ```httperf``` on the same machine on an empty port give the connection limit of httperf to be around ```55000``` per second. 
+In testing, the author had found that the server can handle at least ```10000``` concurrent connections at at least ```40000``` requests / second using ```httperf```. Using ```httperf``` on the same machine on an empty port give the connection limit of httperf to be around ```55000``` per second. 
