@@ -1,8 +1,9 @@
 /**
 This file contains the http_message base class, the http_request class, and the http_response.
 
-To serve a webpage, the server are expected to generate a http_response object based on each http_request object,
+To serve a webpage, the server are expected to generate a http_response object based on the http_request object,
 and send the data through a http_socket object (see http_socket).
+
 */
 
 #include <iostream>
@@ -11,12 +12,13 @@ and send the data through a http_socket object (see http_socket).
 #include <map>
 #include <time.h>  
 class http_message{
-protected://shared fields
+public:
+	//shared fields
 	std::map <std::string, std::string> headers;
 	std::string content;
-public://utilities
 	
-	std::vector <std::string> split(const std::string &s, const std::string &match, size_t limit = -1){
+	//utilities
+	static std::vector <std::string> split(const std::string &s, const std::string &match, size_t limit = -1){
 		//exact match for now
 		//match is expected to be short enough that something like KMP will take longer to do
 		std::vector <std::string> ans;
@@ -62,32 +64,29 @@ public://utilities
 		strftime(buffer, 80, "%a, %d %b %Y %X GMT", time_info);
 		return buffer;
 	}
-	
 };
 
 class http_request: public http_message{
-protected:
+public:
 	std::string type;
 	std::string uri;
-public:
 	
 	http_request(){}
-	void parse(const std::string &s){
-		//cerr<<"Parsing: \r\n"<<s<<"\r\n________________________________________________________________________\r\n";
-		//parse from a string
-		
+	
+	void parse(const std::string &s){//parse from a string. This is slower than parsing from char buffer and/or parsing while reading, but it allow for modular design
+				
 		//Status
 		auto lines = split(s, "\r\n");
 		auto tokens = split(lines[0], " ");
 		type = tokens[0];
 		uri = tokens[1];
-		//string html_ver=tokens[2];//unused, only support http 1.1
+		//string html_ver = tokens[2];//only support http 1.1
 		
 		//Headers
 		headers.clear();
 		int content_start = -1;
 		for(int i = 1; i < lines.size(); i++){
-			tokens=split(lines[i], ": ", 1);
+			tokens = split(lines[i], ": ", 1);
 			if (tokens.empty()){//empty line. This is the end of the header
 				content_start = i + 1;
 				break;
@@ -110,19 +109,36 @@ public:
 
 class http_response: public http_message{//only support html for now
 public:
-	std::string response;
+	std::string status_code, reason_phrase;
+	http_response(): http_message(), status_code(), reason_phrase(){}
 	
-	std::string get_HTTP() const{//get the HTTP raw to send back for an html file
-		return "HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 0\r\n\r\n";
-		std::string res = "";
-		res += "HTTP/1.1 200 OK\r\n";
-		res += "Connection: Keep-Alive\r\n";
-		//res += "Date: " + get_server_time() + "\r\n";
-		res += "Content-Type: text/html; charset=UTF-8\r\n";
-		res += "Content-Length: " + std::to_string(response.size()) + "\r\n";
+	std::string get_HTTP(bool allow_default_value = true){//get the HTTP raw to send back for an html file		
+		if(allow_default_value){
+			if(status_code == ""){
+				status_code = "200";
+			}
+			if(reason_phrase == ""){
+				reason_phrase = "OK";
+			}
+			if(headers.find("Connection") == headers.end()){
+				headers["Connection"] = "Keep-Alive";			
+			}
+			if(headers.find("Content-Type") == headers.end()){
+				headers["Content-Type"] = "text/html; charset=ASCII";			
+			}
+			headers["Content-Length"] = std::to_string(content.size());
+		}
+		
+		std::string res = "HTTP/1.1";//Status line
+		res += " " + status_code + " " + reason_phrase + "\r\n";
+		
+		for(auto &h: headers){//headers
+			res += h.first + ": " + h.second + "\r\n";
+		}
 		res += "\r\n";
-		res += response;
+		
+		//body
+		res += content;
 		return res;
 	}
-	
 };

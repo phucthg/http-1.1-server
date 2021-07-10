@@ -1,7 +1,17 @@
 /*
-	main_thread is used to accept incoming connection and epoll all the active connection
-	if there is some event, a thread is dispatched for each event
-	
+This file contains the http_server base class, and its core functions.
+The http_server class is to be derived from, the handle_request function overriden to handle requests. 
+
+To handle the connection, the http_server class rely heavily of linux's epoll.
+As epoll's performance is very good with large number of file descriptors, it is used to do everything. The summary is like so:
+	-The main thread is responsible for openning up the server fd, accepting new connections and passing them to other threads.
+	this is necessary to reduce the latency in handling connections already established.
+	-A secondary is used to manage everything. This thread run epoll to keep track of all the file descriptors events.
+	-File descriptors events are used to handle:
+		+Request arriving.
+		+New connection in the queue
+		+Thread worker finishing and handing back the fds.
+
 */
 #include <unistd.h>
 #include <fcntl.h>
@@ -15,27 +25,33 @@
 #include "http_socket.hpp"
 
 class http_server{
-	
 protected:
-	const int port, max_concurrent_connection, max_worker_thread;//the local port
+	const int port, max_concurrent_connection, max_worker_thread;
+	//used for accepting connection
 	int server_fd, opt, address_length;
-	struct sockaddr_in address;
 	int concurrent_connection_count;
+	struct sockaddr_in address;
 	http_socket sock[MAX_FD_VALUE];//each fd number will have its own socket object		
+	
 	int ep_fd;//fd for epolling
-	struct epoll_event ep_event, events[MAX_FD_VALUE];//polling infastructures
-	bool is_thread_fd[MAX_FD_VALUE];
-	int thread_fd[MAX_FD_VALUE][2];
-	int thread_id[MAX_FD_VALUE];
-	int working_fd[MAX_FD_VALUE];
+	struct epoll_event ep_event, events[MAX_FD_VALUE];//epolling infastructures
+	
+	//thread control fds
+	bool is_thread_control_fd[MAX_FD_VALUE];
+	int thread_control_fd[MAX_FD_VALUE][2];
+	int pipe_id[MAX_FD_VALUE];
+	int working_fd[MAX_FD_VALUE];//what connection is this pipe serving
+	
+	
 	int connection_pipe[2];
+	uint8_t thread_response[2] = {0, 1};
 	std::vector <int> thread_pool;
-	std::queue <int> fd_queue;
-	std::queue <int> conn_fd_queue;
+	std::queue <int> request_queue;
+	std::queue <int> new_connection_queue;
 public:
 	virtual int handle_request(http_socket& sock) = 0;//this function can be implemented to serve html (or other things)
 	
-	http_server(int port, int max_concurrent_connection = 10000, int max_worker_thread = 512): 
+	http_server(int port, int max_concurrent_connection = 10000, int max_worker_thread = 16): 
 	port(port),	max_concurrent_connection(max_concurrent_connection), max_worker_thread(max_worker_thread), 
 	concurrent_connection_count(0),	address_length(sizeof(address))	{
 		for(int i = 0; i < MAX_FD_VALUE; i++){
@@ -48,19 +64,17 @@ public:
 		}
 		
 		//create the fd reserved for thread handling
-		for(int i=0; i<max_worker_thread; i++){
-			if(pipe2(thread_fd[i], O_NONBLOCK) < 0){
+		for(int i = 0; i<max_worker_thread; i++){
+			if(pipe2(thread_control_fd[i], O_NONBLOCK) < 0){
 				perror("failed to create thread pipe");
 				exit(-1);
 			}
-			is_thread_fd[thread_fd[i][PIPE_READ]]=1;
-			is_thread_fd[thread_fd[i][PIPE_WRITE]]=1;
-			std::cerr<<"Read-write pair: "<<thread_fd[i][PIPE_READ]<<' '<<thread_fd[i][PIPE_WRITE]<<'\n';
-			thread_id[thread_fd[i][PIPE_READ]]=i;
-			thread_id[thread_fd[i][PIPE_WRITE]]=i;
+			is_thread_control_fd[thread_control_fd[i][PIPE_READ]] = 1;
+			is_thread_control_fd[thread_control_fd[i][PIPE_WRITE]] = 1;
+			pipe_id[thread_control_fd[i][PIPE_READ]] = i;
+			pipe_id[thread_control_fd[i][PIPE_WRITE]] = i;
 			thread_pool.push_back(i);
 		}
-
 	}
 	
 	~http_server(){
@@ -73,7 +87,7 @@ public:
 			perror("socket create failed");
 			exit(-1);
 		}
-		std::cerr<<"server_fd: "<<server_fd<<'\n';
+		std::cerr << "server_fd: " << server_fd << '\n';
 		if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))){
 			perror("socketopt failed");
 			exit(-1);
@@ -88,7 +102,7 @@ public:
 			exit(-1);
 		}
 		
-		if(listen(server_fd, 10000) < 0){//back log is set to 32, but doesn't really matter
+		if(listen(server_fd, 10000) < 0){//back log is set to 10000, but doesn't really matter
 			perror("listen");
 			exit(-1);
 		}
@@ -98,30 +112,31 @@ public:
 			exit(-1);
 		}
 		
-		std::thread handler(&http_server::handle_connections, this);
+		std::thread handler(&http_server::handle_connections, this);//thread to handle the connection
 		int new_fd;
 		uint8_t val[2];
 		while(true){
-			new_fd = accept4(server_fd, (struct sockaddr *)&address, (socklen_t*)&address_length, SOCK_NONBLOCK);
+			new_fd = accept4(server_fd, (struct sockaddr *)&address, (socklen_t*)&address_length, SOCK_NONBLOCK);//accept a new socket in nonblock mode
 			val[0] = new_fd & 255;
 			val[1] = new_fd >> 8;
-			//cerr<<new_fd<<'\n';
+			//encoding the socket and send it to the connection thread, this should not fail because it's a local socket
 			write(connection_pipe[PIPE_WRITE], val, 2);
 		}
 	}
 	
 	
-	void handle_connections(){//this function is ran on all the non-main thread
-		//add the server_fd to polling list
+	void handle_connections(){
 		int current_size = 0;//the number of active fd in epoll
+		
+		//add the new connection pipe to epoll
 		ep_event.events = EPOLLIN;//trigger when there is data in
 		ep_event.data.fd = connection_pipe[PIPE_READ];
 		epoll_ctl(ep_fd, EPOLL_CTL_ADD, connection_pipe[PIPE_READ], &ep_event);
 		current_size++;
 		
 		for(int i = 0; i < max_worker_thread; i++){//poll the read ends of thread handling pipes
-			ep_event.data.fd = thread_fd[i][PIPE_READ];
-			epoll_ctl(ep_fd, EPOLL_CTL_ADD, thread_fd[i][PIPE_READ], &ep_event);
+			ep_event.data.fd = thread_control_fd[i][PIPE_READ];
+			epoll_ctl(ep_fd, EPOLL_CTL_ADD, thread_control_fd[i][PIPE_READ], &ep_event);
 			current_size++;
 		}
 		
@@ -129,42 +144,27 @@ public:
 		ep_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;//edge-trigger and 1 shot for connections
 		uint8_t buffer[8];
 		int new_fd, event_count;
-		//std::set <int> alive;
 		while(true){//accept connection and monitor it in epoll
-			//poll
-			
-			
-			event_count = epoll_wait(ep_fd, events, current_size, 1);//poll for 100 ms 
-			
-			/*cerr<<"Concurrent: "<<concurrent_connection_count<<". Worker avaiable: "<<thread_pool.size()<<'\n';
-			int temp=10;
-			for(int x: alive){
-				cerr<<x<<' ';
-				temp--;
-				if(temp==0) break;
-			}
-			cerr<<'\n';
-			*/
+			event_count = epoll_wait(ep_fd, events, current_size, -1);
 			
 			for(int i = 0; i < event_count; i++){//deal with events
-				//cerr<<events[i].data.fd<<'\n';
 				if(events[i].data.fd == connection_pipe[PIPE_READ]){
+					//new connection 
 					int res = read(events[i].data.fd, buffer, 2); 
 					if(res != 2){
 						perror("connection threads protocol failed");
 						exit(-1);
 					}
 					new_fd = (((int)buffer[1]) << 8) | buffer[0];
-					conn_fd_queue.push(new_fd);
+					new_connection_queue.push(new_fd);
+					//saved for later
 				}
-				else if(is_thread_fd[events[i].data.fd]){//this should be a worker thread finishing
-					//std::cerr<<"Thread return: "<<events[i].data.fd<<'\n';
-					int pipe = thread_id[events[i].data.fd];
+				else if(is_thread_control_fd[events[i].data.fd]){//this should be a worker thread finishing
+					int pipe = pipe_id[events[i].data.fd];
 					thread_pool.push_back(pipe);
 					
 					int connection_fd = working_fd[pipe];
-					int count = read(thread_fd[pipe][PIPE_READ], buffer, 8);
-					//std:cerr<<"Buffer is: "<<int(buffer[0])<<'\n';
+					int count = read(thread_control_fd[pipe][PIPE_READ], buffer, 8);
 					if(count != 1){
 						perror("threads protocol failed");
 						exit(-1);
@@ -173,9 +173,7 @@ public:
 					if(buffer[0]){//connection terminated, remove the fd
 						concurrent_connection_count--;
 						epoll_ctl(ep_fd, EPOLL_CTL_DEL, connection_fd, NULL);
-						//alive.erase(connection_fd);
 						close(connection_fd);//fd will not be closed outside of this place
-						//cerr<<"Closed fd: "<<connection_fd<<'\n';
 					}
 					else{//rearm the fd
 						ep_event.data.fd = connection_fd;
@@ -184,50 +182,48 @@ public:
 					}
 				}
 				else{//this should be a connection recieving something
-					//cerr<<"Data received: "<<events[i].data.fd<<'\n';
-					//cerr<<events[i].events<<'\n';
 					if(events[i].events & EPOLLERR){//error, just close this pipe and ignore this connection
-						cerr<<"Error!\n";
+						cerr << "Error!\n";
 						epoll_ctl(ep_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-						//alive.erase(events[i].data.fd);
-						close(events[i].data.fd);//fd will not be closed outside of this place
+						close(events[i].data.fd);
 					}
 					else if(events[i].events & EPOLLHUP){
-						cerr<<"Hanged up!\n";
-						//alive.erase(events[i].data.fd);
+						cerr << "Hanged up!\n";
 						epoll_ctl(ep_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-						close(events[i].data.fd);//fd will not be closed outside of this place
+						close(events[i].data.fd);
 					}
 					else{
-						fd_queue.push(events[i].data.fd);//enqueue to be used later
+						request_queue.push(events[i].data.fd);//enqueued to be used later
 						current_size--;
 					}
 				}
 			}
 			
-			while(concurrent_connection_count < max_concurrent_connection){//if the connection count is not maxed, accept this new connection
-				if(conn_fd_queue.empty()) break;
-				new_fd = conn_fd_queue.front();
-				conn_fd_queue.pop();
+			while(concurrent_connection_count < max_concurrent_connection){//if the connection count is not maxed, accept new connections
+				if(new_connection_queue.empty()){
+					break;
+				}
+				new_fd = new_connection_queue.front();
+				new_connection_queue.pop();
 				
-				//cerr<<"Opened fd: "<<new_fd<<'\n';
 				
 				concurrent_connection_count++;
 				//add the fd to epoll
 				ep_event.data.fd = new_fd;
-				//alive.insert(new_fd);
 				epoll_ctl(ep_fd, EPOLL_CTL_ADD, new_fd, &ep_event);
 				current_size++;
 			}
 			//assign connection to worker_thread
-			while(!fd_queue.empty()){
-				if(thread_pool.empty()) break;
-				//cerr<<"Connection can be served!\n";
+			//using actual thread pool could potentially speed this up, but it lead to more complicated request distribusing problem
+			while(!request_queue.empty()){
+				if(thread_pool.empty()){
+					break;
+				}
 				
 				int id = thread_pool.back();
 				thread_pool.pop_back();
-				int fd = fd_queue.front();
-				fd_queue.pop();
+				int fd = request_queue.front();
+				request_queue.pop();
 				
 				working_fd[id] = fd;
 				std::thread worker(&http_server::handle_fd, this, id, fd);
@@ -237,19 +233,17 @@ public:
 	}
 	
 	void handle_fd(int id, int fd){
-		//std::cerr<<"Handler: "<<id<<' '<<fd<<'\n';
 		int res = sock[fd].receive_message();
-		char buffer[2] = {0, 1};
 		if(res < 0){//message is somehow incorrect, drop this connection
-			write(thread_fd[id][PIPE_WRITE], buffer+1, 1);
+			write(thread_control_fd[id][PIPE_WRITE], thread_response + 1, 1);
 		}
 		else{
 			res = handle_request(sock[fd]);
 			if(res == 0){//handler successfully handled the reqest and want to keep the connection going
-				write(thread_fd[id][PIPE_WRITE], buffer+0, 1);
+				write(thread_control_fd[id][PIPE_WRITE], thread_response + 0, 1);
 			}
 			else{//handler either refused to answer or want to terminate after answering
-				write(thread_fd[id][PIPE_WRITE], buffer+1, 1);
+				write(thread_control_fd[id][PIPE_WRITE], thread_response + 1, 1);
 			}
 		}
 	}

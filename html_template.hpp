@@ -2,8 +2,9 @@
 This file contains the html_template class.
 
 It is a helper for webpages allow generating html files with custom contents based on the request.
+It is not an essential part of the http server code.
 
-The template will be very basic for now:
+The template is be very basic for now:
 	-Everything is kept the same.
 	-EOLs will be replaced with \r\n
 	-'%' are replaced by input strings in that order unless preceded by a '\'
